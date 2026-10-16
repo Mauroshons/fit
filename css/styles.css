@@ -274,6 +274,25 @@ ul.diag b { color: #cfe0ef; text-align: right; word-break: break-word; }
 .metric.expanded .m-hint { display: block; }
 .metric[data-hint] { cursor: help; }
 
+/* ------------------- Confianza de detección por articulación ------------------- */
+ul.vis-list { list-style: none; margin: 0; padding: 0; }
+ul.vis-list li {
+  display: grid; grid-template-columns: 5.5em 1fr 2.8em;
+  align-items: center; gap: 9px; padding: 3px 0; font-size: 12.5px;
+}
+ul.vis-list span { color: var(--muted); }
+ul.vis-list i { display: block; height: 5px; border-radius: 3px; background: #202a36; overflow: hidden; }
+ul.vis-list i b { display: block; height: 100%; background: var(--accent); border-radius: 3px; transition: width .12s linear; }
+ul.vis-list em { font-style: normal; text-align: right; font-variant-numeric: tabular-nums; color: #cfe0ef; }
+ul.vis-list li.weak span, ul.vis-list li.weak em { color: var(--warn); }
+ul.vis-list li.weak i b { background: var(--warn); }
+
+.vis-help { font-size: 12px; line-height: 1.55; color: #8fa0b3; margin: 12px 0 0; }
+.vis-swatch {
+  display: inline-block; width: 10px; height: 10px; border-radius: 50%;
+  border: 2px solid var(--warn); vertical-align: -1px;
+}
+
 .bar { position: relative; height: 4px; border-radius: 2px; background: #202a36; margin-top: 7px; overflow: hidden; }
 .bar .zone { position: absolute; top: 0; bottom: 0; background: rgba(53, 208, 127, .35); }
 .bar .mark { position: absolute; top: -2px; width: 2px; height: 8px; background: var(--text); border-radius: 1px; }

@@ -6,7 +6,7 @@ import {
 
 import { EMA, median } from './geometry.js';
 import {
-  LM, SKELETON, pickSide, sidePoints, frameMetricsSagittal, frameMetricsFrontal,
+  LM, SKELETON, MIN_VIS, pickSide, sidePoints, frameMetricsSagittal, frameMetricsFrontal,
   PedalCycleTracker, pxToMm,
 } from './analyzer.js';
 import { evaluate } from './fitrules.js';
@@ -33,6 +33,7 @@ const el = {
   duration: $('duration'), mirror: $('mirror'), estimates: $('estimates'),
   modelQuality: $('modelQuality'),
   liveMetrics: $('liveMetrics'), livePlaceholder: $('livePlaceholder'),
+  visibility: $('visibility'),
   report: $('report'), reportPlaceholder: $('reportPlaceholder'),
   reportMetrics: $('reportMetrics'), reportRecs: $('reportRecs'),
   reportTitle: $('reportTitle'), reportMeta: $('reportMeta'),
@@ -374,6 +375,7 @@ function processResult(result, w, h) {
     { label: 'Hombro', value: m.shoulder, unit: '°' },
     { label: 'Tobillo', value: m.ankle, unit: '°' },
   ]);
+  renderVisibility(m.vis);
 
   if (state.recording) {
     state.tracker.push(performance.now(), m, p);
@@ -386,28 +388,53 @@ function processResult(result, w, h) {
 
 /* ============================== Dibujo ============================== */
 
-const COLORS = { active: '#35d07f', dim: 'rgba(160,185,210,.38)', text: '#eaf4ff' };
+const COLORS = {
+  active: '#35d07f',
+  dim: 'rgba(160,185,210,.38)',
+  text: '#eaf4ff',
+  unsure: '#f0b429',   // visible para el modelo, pero por debajo del umbral
+};
 
 function drawSkeleton(ctx, lms, w, h, side) {
   const S = side === 'right' ? 'R' : side === 'left' ? 'L' : null;
+  const vis = (pt) => pt?.visibility ?? 1;
   ctx.lineWidth = Math.max(2, w / 420);
 
   for (const [a, b] of SKELETON) {
     const onSide = S && a.endsWith(S) && b.endsWith(S);
     const pa = lms[LM[a]], pb = lms[LM[b]];
     if (!pa || !pb) continue;
-    ctx.strokeStyle = !S || onSide ? COLORS.active : COLORS.dim;
+    // Un tramo que cuelga de un punto poco fiable se dibuja punteado: así se
+    // ve de un vistazo que ese ángulo no se está midiendo.
+    const weak = (!S || onSide) && Math.min(vis(pa), vis(pb)) < MIN_VIS;
+    ctx.save();
+    if (weak) ctx.setLineDash([5, 5]);
+    ctx.strokeStyle = !S || onSide ? (weak ? COLORS.unsure : COLORS.active) : COLORS.dim;
     ctx.beginPath();
     ctx.moveTo(pa.x * w, pa.y * h);
     ctx.lineTo(pb.x * w, pb.y * h);
     ctx.stroke();
+    ctx.restore();
   }
 
   const r = Math.max(3, w / 300);
   for (const name of Object.keys(LM)) {
     const pt = lms[LM[name]];
-    if (!pt || (pt.visibility ?? 1) < 0.35) continue;
+    if (!pt) continue;
     const onSide = S && name.endsWith(S);
+    // Antes los puntos flojos simplemente no se pintaban, así que una muñeca
+    // sin detectar era indistinguible de una ausente. Ahora sale hueca.
+    if (vis(pt) < MIN_VIS) {
+      if (!S || onSide) {
+        ctx.strokeStyle = COLORS.unsure;
+        ctx.lineWidth = Math.max(1.5, w / 600);
+        ctx.beginPath();
+        ctx.arc(pt.x * w, pt.y * h, r * 1.25, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.lineWidth = Math.max(2, w / 420);
+      }
+      continue;
+    }
     ctx.fillStyle = !S || onSide ? COLORS.active : COLORS.dim;
     ctx.beginPath();
     ctx.arc(pt.x * w, pt.y * h, r, 0, Math.PI * 2);
@@ -462,6 +489,27 @@ function renderLive(items) {
       <div class="m-label">${i.label}</div>
       <div class="m-value">${Number.isFinite(i.value) ? i.value.toFixed(0) + i.unit : '—'}</div>
     </div>`).join('');
+}
+
+const JOINT_NAMES = {
+  shoulder: 'Hombro', elbow: 'Codo', wrist: 'Muñeca', hip: 'Cadera',
+  knee: 'Rodilla', ankle: 'Tobillo', foot: 'Metatarso',
+};
+
+/** Barra de confianza por articulación: señala cuál no se está viendo. */
+function renderVisibility(vis) {
+  if (!vis) return;
+  el.visibility.hidden = false;
+  el.visibility.innerHTML = Object.entries(vis).map(([j, v]) => {
+    const pct = Math.round((v ?? 0) * 100);
+    const weak = (v ?? 0) < MIN_VIS;
+    return `
+      <li class="${weak ? 'weak' : ''}">
+        <span>${JOINT_NAMES[j] ?? j}</span>
+        <i><b style="width:${pct}%"></b></i>
+        <em>${pct}%</em>
+      </li>`;
+  }).join('');
 }
 
 function renderMetrics(container, metrics) {
@@ -700,6 +748,7 @@ function runDemo() {
     ankleAtBdc: 112, ankleAtTdc: 86, ankleRom: 22,
     torso: 47, elbow: 172, shoulder: 88, arm: 24,
     kopsPx: 18.7, femurPx: 266, crankTravelPx: 230,
+    vis: { shoulder: 0.97, elbow: 0.91, wrist: 0.88, hip: 0.96, knee: 0.94, ankle: 0.93, foot: 0.82 },
   }));
   el.riderName.value = el.riderName.value || 'Ciclista de ejemplo';
   makeReport();

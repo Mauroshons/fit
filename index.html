@@ -153,6 +153,13 @@
     <div class="tabpane" id="tab-live">
       <div id="liveMetrics" class="metric-grid"></div>
       <div id="livePlaceholder" class="placeholder">Activa la cámara para ver los ángulos en tiempo real.</div>
+      <h3 id="visibilityTitle">Confianza de detección</h3>
+      <ul id="visibility" class="vis-list" hidden></ul>
+      <p class="vis-help">
+        Un ángulo solo se mide si <strong>todas</strong> sus articulaciones superan el 50 %.
+        Si no, aparece «—» en vez de un número inventado. En el overlay, los puntos
+        poco fiables se dibujan <span class="vis-swatch"></span> huecos y en ámbar.
+      </p>
     </div>
 
     <!-- --- Informe --- -->

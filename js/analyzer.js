@@ -1,7 +1,7 @@
 // Núcleo de medición: extrae métricas articulares por frame, segmenta los
 // ciclos de pedaleo y agrega los resultados de la sesión.
 
-import { toPixels, dist, angle3, angleToHorizontal, median, stdev } from './geometry.js';
+import { toPixels, dist, angle3, angleToHorizontal, median, stdev, minOf, maxOf } from './geometry.js';
 
 export const LM = {
   nose: 0,
@@ -59,21 +59,44 @@ export function sidePoints(landmarks, side, width, height) {
  * Métricas sagitales de un frame. Todas en grados salvo las que indican px.
  * La imagen tiene el eje Y hacia abajo: por eso "más arriba" = menor y.
  */
+// Por debajo de esto MediaPipe está extrapolando la posición en vez de verla.
+// Las muñecas sobre el manillar son el caso típico: quedan tapadas por el
+// antebrazo y la propia barra, y el modelo devuelve una coordenada inventada.
+export const MIN_VIS = 0.5;
+
+/** Comprueba que todos los puntos implicados se estén viendo de verdad. */
+function seen(...points) {
+  return points.every((pt) => (pt?.v ?? 0) >= MIN_VIS);
+}
+
+/** Ángulo medido solo si sus tres puntos son visibles; si no, NaN. */
+function angleIfSeen(a, b, c) {
+  return seen(a, b, c) ? angle3(a, b, c) : NaN;
+}
+
 export function frameMetricsSagittal(p) {
   return {
-    knee: angle3(p.hip, p.knee, p.ankle),              // extensión de rodilla
-    hip: angle3(p.shoulder, p.hip, p.knee),            // apertura cadera-torso
-    elbow: angle3(p.shoulder, p.elbow, p.wrist),       // flexión de codo
-    shoulder: angle3(p.hip, p.shoulder, p.elbow),      // ángulo hombro (tronco-brazo)
-    ankle: angle3(p.knee, p.ankle, p.foot),            // flexión plantar/dorsal
-    torso: angleToHorizontal(p.hip, p.shoulder),       // inclinación del torso
-    arm: angleToHorizontal(p.shoulder, p.wrist),       // inclinación brazo->manillar
+    knee: angleIfSeen(p.hip, p.knee, p.ankle),         // extensión de rodilla
+    hip: angleIfSeen(p.shoulder, p.hip, p.knee),       // apertura cadera-torso
+    elbow: angleIfSeen(p.shoulder, p.elbow, p.wrist),  // flexión de codo
+    shoulder: angleIfSeen(p.hip, p.shoulder, p.elbow), // ángulo hombro (tronco-brazo)
+    ankle: angleIfSeen(p.knee, p.ankle, p.foot),       // flexión plantar/dorsal
+    torso: seen(p.hip, p.shoulder) ? angleToHorizontal(p.hip, p.shoulder) : NaN,
+    arm: seen(p.shoulder, p.wrist) ? angleToHorizontal(p.shoulder, p.wrist) : NaN,
+    // Visibilidad cruda de cada articulación, para avisar de qué no se está
+    // viendo en lugar de devolver un número inventado.
+    vis: {
+      shoulder: p.shoulder.v, elbow: p.elbow.v, wrist: p.wrist.v,
+      hip: p.hip.v, knee: p.knee.v, ankle: p.ankle.v, foot: p.foot.v,
+    },
     // Hacia dónde mira el ciclista: en ruta el hombro queda por delante de la
     // cadera. Sirve para dar signo coherente a KOPS mire hacia donde mire.
     facing: Math.sign(p.shoulder.x - p.hip.x) || 1,
     // Desfase horizontal rodilla vs eje de pedal (proxy: metatarso).
     // Positivo = rodilla por delante del eje.
-    kopsPx: (p.knee.x - p.foot.x) * (Math.sign(p.shoulder.x - p.hip.x) || 1),
+    kopsPx: seen(p.knee, p.foot)
+      ? (p.knee.x - p.foot.x) * (Math.sign(p.shoulder.x - p.hip.x) || 1)
+      : NaN,
     // Escala de referencia para estimar mm.
     femurPx: dist(p.hip, p.knee),
     tibiaPx: dist(p.knee, p.ankle),
@@ -193,12 +216,11 @@ export class PedalCycleTracker {
       durationMs: tEnd - this.cycleStart,
       kneeExtension: s[iMax].knee,          // máxima extensión (PMI)
       kneeFlexion: s[iMin].knee,            // máxima flexión (PMS)
-      hipMin: Math.min(...s.map((x) => x.hip).filter(Number.isFinite)),
-      hipMax: Math.max(...s.map((x) => x.hip).filter(Number.isFinite)),
+      hipMin: minOf(s.map((x) => x.hip)),
+      hipMax: maxOf(s.map((x) => x.hip)),
       ankleAtBdc: s[iMax].ankle,
       ankleAtTdc: s[iMin].ankle,
-      ankleRom: Math.max(...s.map((x) => x.ankle).filter(Number.isFinite)) -
-                Math.min(...s.map((x) => x.ankle).filter(Number.isFinite)),
+      ankleRom: maxOf(s.map((x) => x.ankle)) - minOf(s.map((x) => x.ankle)),
       torso: median(s.map((x) => x.torso)),
       elbow: median(s.map((x) => x.elbow)),
       shoulder: median(s.map((x) => x.shoulder)),
@@ -206,6 +228,10 @@ export class PedalCycleTracker {
       kopsPx: s[iFwd].kopsPx,
       femurPx: median(s.map((x) => x.femurPx)),
       crankTravelPx: this.center?.rangeY ?? NaN,
+      // Visibilidad mediana de cada articulación durante el ciclo.
+      vis: Object.fromEntries(
+        Object.keys(s[0].vis ?? {}).map((j) => [j, median(s.map((x) => x.vis?.[j]))]),
+      ),
     };
   }
 
@@ -235,6 +261,9 @@ export class PedalCycleTracker {
       kopsPx: median(col('kopsPx')),
       femurPx: median(col('femurPx')),
       crankTravelPx: median(col('crankTravelPx')),
+      vis: Object.fromEntries(
+        Object.keys(c[0].vis ?? {}).map((j) => [j, median(c.map((x) => x.vis?.[j]))]),
+      ),
     };
   }
 }

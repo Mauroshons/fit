@@ -64,6 +64,19 @@ export function clamp(x, lo, hi) {
   return Math.min(hi, Math.max(lo, x));
 }
 
+// Math.min() sin argumentos devuelve Infinity y Math.max() devuelve -Infinity.
+// Al descartar métricas por visibilidad eso se colaría como si fuera un dato
+// válido, así que estas versiones devuelven NaN cuando no queda nada que medir.
+export function minOf(arr) {
+  const v = arr.filter(Number.isFinite);
+  return v.length ? Math.min(...v) : NaN;
+}
+
+export function maxOf(arr) {
+  const v = arr.filter(Number.isFinite);
+  return v.length ? Math.max(...v) : NaN;
+}
+
 /** Filtro exponencial para suavizar landmarks frame a frame. */
 export class EMA {
   constructor(alpha = 0.4) {

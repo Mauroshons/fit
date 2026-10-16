@@ -350,6 +350,32 @@ function buildRecommendations(metrics, summary, opts) {
     });
   }
 
+  // --- Articulaciones que el modelo no llegó a ver ---
+  const NOMBRES = {
+    shoulder: 'hombro', elbow: 'codo', wrist: 'muñeca', hip: 'cadera',
+    knee: 'rodilla', ankle: 'tobillo', foot: 'metatarso',
+  };
+  const flojas = Object.entries(summary.vis ?? {})
+    .filter(([, v]) => Number.isFinite(v) && v < 0.5)
+    .sort((a, b) => a[1] - b[1]);
+
+  if (flojas.length) {
+    const lista = flojas.map(([j, v]) => `${NOMBRES[j] ?? j} (${(v * 100).toFixed(0)}%)`).join(', ');
+    const soloBrazo = flojas.every(([j]) => ['wrist', 'elbow', 'shoulder'].includes(j));
+    add({
+      area: 'Captura · visibilidad',
+      priority: 'alta',
+      action: `Repetir la captura: no se ven bien ${lista}`,
+      why: `Las métricas que dependen de esas articulaciones aparecen como «—» en lugar de inventar un número. ${
+        soloBrazo
+          ? 'Las muñecas sobre el manillar suelen quedar tapadas por el antebrazo y por la propia barra, y con ellas se pierde el ángulo de codo.'
+          : 'Sin esos puntos no hay forma de medir los ángulos que los usan.'}`,
+      note: soloBrazo
+        ? 'Prueba a adelantar un poco la cámara para que la mano quede despejada contra el fondo, a usar manga corta o muñequera de color contrastado, y a evitar que el manillar se recorte en el borde del cuadro.'
+        : 'Revisa que el ciclista entre completo en el cuadro, con luz frontal y sin elementos del rodillo tapando las piernas.',
+    });
+  }
+
   if (!mmPerPx && !opts.frontalOnly) {
     add({
       area: 'Calibración',
