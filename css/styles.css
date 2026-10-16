@@ -288,6 +288,8 @@ ul.vis-list li.weak span, ul.vis-list li.weak em { color: var(--warn); }
 ul.vis-list li.weak i b { background: var(--warn); }
 
 .vis-help { font-size: 12px; line-height: 1.55; color: #8fa0b3; margin: 12px 0 0; }
+.vis-help a { color: var(--accent-2); text-decoration: none; white-space: nowrap; }
+.vis-help a:hover { text-decoration: underline; }
 .vis-swatch {
   display: inline-block; width: 10px; height: 10px; border-radius: 50%;
   border: 2px solid var(--warn); vertical-align: -1px;

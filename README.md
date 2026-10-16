@@ -6,6 +6,14 @@ mide los ángulos articulares clave y emite recomendaciones de ajuste.
 
 Todo corre **en el navegador**: el vídeo nunca sale del dispositivo.
 
+**▶ Abrir la app: <https://mauroshons.github.io/fit/>**
+
+## Manuales
+
+- **[Cómo medir el sillín](MANUAL-SILLIN.md)** — paso a paso de la pestaña *Cotas*:
+  preparación, los cinco puntos, y el flujo completo para reproducir la posición
+  al cambiar de sillín, de tija o tras desmontar la bici.
+
 ## Arrancar
 
 ```bash
