@@ -1,0 +1,729 @@
+// Orquestación de la app: cámara, inferencia de pose, overlay y UI.
+
+import {
+  FilesetResolver, PoseLandmarker,
+} from 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs';
+
+import { EMA, median } from './geometry.js';
+import {
+  LM, SKELETON, pickSide, sidePoints, frameMetricsSagittal, frameMetricsFrontal,
+  PedalCycleTracker, pxToMm,
+} from './analyzer.js';
+import { evaluate } from './fitrules.js';
+
+const WASM_BASE = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm';
+
+// Tres pesos del mismo modelo. En un móvil el "alto" es inviable y el "ligero"
+// paga con ruido en los centros articulares, que es justo lo que medimos.
+const MODELS = {
+  lite: { label: 'ligero', mb: 5, url: 'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task' },
+  full: { label: 'estándar', mb: 9, url: 'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task' },
+  heavy: { label: 'alto', mb: 29, url: 'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_heavy/float16/1/pose_landmarker_heavy.task' },
+};
+
+const $ = (id) => document.getElementById(id);
+const el = {
+  video: $('video'), overlay: $('overlay'), stage: $('stage'), stageMsg: $('stageMsg'),
+  engineState: $('engineState'), recBadge: $('recBadge'),
+  hudSide: $('hudSide'), hudFps: $('hudFps'), hudCycles: $('hudCycles'), hudCadence: $('hudCadence'),
+  btnCamera: $('btnCamera'), btnRecord: $('btnRecord'), btnSnapshot: $('btnSnapshot'),
+  cameraSelect: $('cameraSelect'),
+  riderName: $('riderName'), viewMode: $('viewMode'), profile: $('profile'),
+  sideSelect: $('sideSelect'), crankLength: $('crankLength'), inseam: $('inseam'),
+  duration: $('duration'), mirror: $('mirror'), estimates: $('estimates'),
+  modelQuality: $('modelQuality'),
+  liveMetrics: $('liveMetrics'), livePlaceholder: $('livePlaceholder'),
+  report: $('report'), reportPlaceholder: $('reportPlaceholder'),
+  reportMetrics: $('reportMetrics'), reportRecs: $('reportRecs'),
+  reportTitle: $('reportTitle'), reportMeta: $('reportMeta'),
+  btnExport: $('btnExport'), btnPrint: $('btnPrint'),
+};
+
+const state = {
+  landmarker: null,
+  stream: null,
+  running: false,
+  recording: false,
+  recordUntil: 0,
+  lastVideoTime: -1,
+  smoother: new EMA(0.45),
+  tracker: new PedalCycleTracker(),
+  frontalSamples: [],
+  side: 'right',
+  fps: { last: performance.now(), frames: 0, value: 0 },
+  lastReport: null,
+  modelKey: 'full',
+  delegate: null,
+};
+
+/* ============================ Motor de pose ============================ */
+
+/** Heurística de dispositivo para elegir el peso por defecto del modelo. */
+function defaultModelKey() {
+  const fromUrl = new URLSearchParams(location.search).get('model');
+  if (MODELS[fromUrl]) return fromUrl;
+  const coarse = matchMedia('(pointer: coarse)').matches;
+  const small = Math.min(screen.width, screen.height) < 820;
+  return coarse && small ? 'lite' : 'full';
+}
+
+let fileset = null;
+
+async function initEngine(key = state.modelKey) {
+  state.modelKey = key;
+  const model = MODELS[key];
+  // Soltamos el anterior antes de cargar: el bucle no debe tocar un
+  // landmarker a medio cerrar.
+  const previous = state.landmarker;
+  state.landmarker = null;
+  previous?.close();
+
+  setEngine('wait', `Cargando modelo ${model.label} (~${model.mb} MB)…`);
+  el.btnCamera.disabled = true;
+  try {
+    fileset ??= await FilesetResolver.forVisionTasks(WASM_BASE);
+    const options = {
+      runningMode: 'VIDEO',
+      numPoses: 1,
+      minPoseDetectionConfidence: 0.5,
+      minPosePresenceConfidence: 0.5,
+      minTrackingConfidence: 0.5,
+      outputSegmentationMasks: false,
+    };
+    // Safari en iOS/iPadOS falla a veces al inicializar el delegado GPU según
+    // la versión de WebKit. Si pasa, seguimos por CPU en vez de morir.
+    try {
+      state.landmarker = await PoseLandmarker.createFromOptions(fileset, {
+        ...options, baseOptions: { modelAssetPath: model.url, delegate: 'GPU' },
+      });
+      state.delegate = 'GPU';
+    } catch (gpuErr) {
+      console.warn('Delegado GPU no disponible, reintentando por CPU:', gpuErr);
+      state.landmarker = await PoseLandmarker.createFromOptions(fileset, {
+        ...options, baseOptions: { modelAssetPath: model.url, delegate: 'CPU' },
+      });
+      state.delegate = 'CPU';
+    }
+    setEngine('ok', `Modelo ${model.label} listo${state.delegate === 'CPU' ? ' (CPU)' : ''}`);
+    el.btnCamera.disabled = false;
+  } catch (err) {
+    console.error(err);
+    setEngine('bad', 'Error cargando el modelo');
+    showStageError(
+      'No se pudo cargar el modelo de pose',
+      `Se descarga desde el CDN de Google (~${model.mb} MB) y luego queda en caché. Revisa la conexión; si estás en una red corporativa puede estar bloqueado <code>storage.googleapis.com</code>.`,
+      await collectDiagnostics(), err);
+  }
+}
+
+function setEngine(kind, text) {
+  el.engineState.className = `pill pill-${kind === 'ok' ? 'ok' : kind === 'bad' ? 'bad' : 'wait'}`;
+  el.engineState.textContent = text;
+}
+
+/* ============================== Cámara ============================== */
+
+async function listCameras() {
+  try {
+    const devices = (await navigator.mediaDevices.enumerateDevices())
+      .filter((d) => d.kind === 'videoinput');
+    if (devices.length < 2) return;
+    el.cameraSelect.hidden = false;
+    el.cameraSelect.innerHTML = devices
+      .map((d, i) => `<option value="${d.deviceId}">${d.label || `Cámara ${i + 1}`}</option>`)
+      .join('');
+    if (state.stream) {
+      const id = state.stream.getVideoTracks()[0].getSettings().deviceId;
+      if (id) el.cameraSelect.value = id;
+    }
+  } catch { /* enumerateDevices puede fallar sin permisos */ }
+}
+
+/** Reúne el contexto que hace falta para explicar un fallo de cámara. */
+async function collectDiagnostics() {
+  const d = {
+    protocolo: location.protocol,
+    origen: location.host || '(sin host)',
+    'contexto seguro': window.isSecureContext ? 'sí' : 'NO',
+    'API mediaDevices': navigator.mediaDevices?.getUserMedia ? 'disponible' : 'NO DISPONIBLE',
+    'dentro de iframe': window.self !== window.top ? 'SÍ' : 'no',
+  };
+  try {
+    const st = await navigator.permissions?.query({ name: 'camera' });
+    if (st) d['permiso de cámara'] = st.state;
+  } catch { /* Firefox no soporta la consulta del permiso de cámara */ }
+  try {
+    const cams = (await navigator.mediaDevices.enumerateDevices()).filter((x) => x.kind === 'videoinput');
+    d['cámaras detectadas'] = cams.length
+      ? cams.map((c, i) => c.label || `cámara ${i + 1} (sin permiso para leer el nombre)`).join(', ')
+      : 'ninguna';
+  } catch (e) {
+    d['cámaras detectadas'] = `error al enumerar (${e.name})`;
+  }
+  return d;
+}
+
+/** Traduce el error de getUserMedia a una causa y una acción concretas. */
+function describeError(err, diag) {
+  const inIframe = diag['dentro de iframe'] === 'SÍ';
+  switch (err?.name) {
+    case 'NotAllowedError':
+    case 'PermissionDeniedError':
+      return inIframe
+        ? ['Permiso bloqueado por el contenedor',
+           'La página está incrustada en un <strong>iframe sin permiso de cámara</strong>. Ábrela en una pestaña normal del navegador: <code>http://localhost:5173</code>.']
+        : ['Permiso denegado',
+           'Has bloqueado la cámara para este sitio. Pulsa el <strong>candado</strong> (o el icono de cámara tachada) en la barra de direcciones, permite la cámara y recarga la página.'];
+    case 'NotFoundError':
+    case 'DevicesNotFoundError':
+      return ['No hay ninguna cámara',
+              'El navegador no encuentra dispositivos de vídeo. Comprueba que la webcam esté conectada y habilitada en el sistema.'];
+    case 'NotReadableError':
+    case 'TrackStartError':
+      return ['La cámara está ocupada',
+              'Otra aplicación la está usando (Teams, Zoom, Meet, Cámara de Windows…) o el driver falló. Ciérralas y vuelve a intentarlo.'];
+    case 'OverconstrainedError':
+      return ['La cámara no admite lo pedido',
+              `Falló la restricción <code>${err.constraint || 'desconocida'}</code>. Prueba a elegir otra cámara en el selector.`];
+    case 'SecurityError':
+      return ['Bloqueado por seguridad',
+              'El navegador solo da acceso a la cámara en <code>localhost</code> o <code>https</code>.'];
+    default:
+      return ['No se pudo abrir la cámara', 'Revisa el detalle técnico de abajo.'];
+  }
+}
+
+function showStageError(title, body, diag, err) {
+  const rows = Object.entries(diag).map(([k, v]) => `<li><span>${k}</span><b>${v}</b></li>`).join('');
+  el.stageMsg.hidden = false;
+  el.stageMsg.innerHTML = `
+    <div class="err-box">
+      <h2>${title}</h2>
+      <p>${body}</p>
+      ${err ? `<p class="err-tech"><code>${err.name}: ${err.message || 'sin mensaje'}</code></p>` : ''}
+      <ul class="diag">${rows}</ul>
+    </div>`;
+}
+
+async function startCamera(deviceId) {
+  const diag = await collectDiagnostics();
+
+  if (!navigator.mediaDevices?.getUserMedia) {
+    showStageError(
+      'Este navegador no expone la cámara',
+      window.isSecureContext
+        ? 'La API <code>mediaDevices</code> no está disponible. Usa Chrome, Edge, Firefox o Safari actualizados.'
+        : 'Has abierto la página sin contexto seguro (probablemente con <code>file://</code>). Arranca el servidor con <code>node server.mjs</code> y entra por <code>http://localhost:5173</code>.',
+      diag, null);
+    return;
+  }
+
+  stopCamera();
+
+  // De lo más específico a lo más permisivo: si la cámara no acepta 1280x720
+  // o no hay cámara trasera, seguimos intentándolo en vez de fallar.
+  const attempts = [
+    deviceId && { deviceId: { exact: deviceId }, width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } },
+    { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } },
+    { width: { ideal: 1280 }, height: { ideal: 720 } },
+    true,
+  ].filter(Boolean);
+
+  let lastErr = null;
+  for (const video of attempts) {
+    try {
+      state.stream = await navigator.mediaDevices.getUserMedia({ video, audio: false });
+      lastErr = null;
+      break;
+    } catch (e) {
+      lastErr = e;
+      // Si el usuario deniega el permiso, reintentar no cambia nada.
+      if (e.name === 'NotAllowedError' || e.name === 'PermissionDeniedError') break;
+    }
+  }
+
+  if (lastErr) {
+    console.error('getUserMedia falló:', lastErr);
+    const [title, body] = describeError(lastErr, diag);
+    showStageError(title, body, await collectDiagnostics(), lastErr);
+    return;
+  }
+
+  try {
+    el.video.srcObject = state.stream;
+    await el.video.play();
+    el.stageMsg.hidden = true;
+    el.btnCamera.textContent = 'Apagar cámara';
+    el.btnRecord.disabled = false;
+    el.btnSnapshot.disabled = false;
+    el.livePlaceholder.hidden = true;
+    state.running = true;
+    state.smoother.reset();
+    state.tracker.reset();
+    await listCameras();
+    requestAnimationFrame(loop);
+  } catch (err) {
+    // El stream se obtuvo pero el <video> no arrancó (autoplay, códec, etc.).
+    console.error('No arrancó la reproducción:', err);
+    showStageError(
+      'La cámara se abrió pero el vídeo no arranca',
+      'El navegador concedió el stream pero bloqueó la reproducción. Vuelve a pulsar <strong>Activar cámara</strong>; si persiste, recarga la página.',
+      await collectDiagnostics(), err);
+    stopCamera();
+  }
+}
+
+// El cartel del escenario se reescribe con paneles de error; guardamos el
+// contenido original para poder restaurarlo al apagar la cámara.
+const STAGE_MSG_DEFAULT = el.stageMsg.innerHTML;
+
+function stopCamera() {
+  state.running = false;
+  stopRecording(false);
+  state.stream?.getTracks().forEach((t) => t.stop());
+  state.stream = null;
+  el.video.srcObject = null;
+  el.btnCamera.textContent = 'Activar cámara';
+  el.btnRecord.disabled = true;
+  el.btnSnapshot.disabled = true;
+  el.stageMsg.innerHTML = STAGE_MSG_DEFAULT;
+  el.stageMsg.hidden = false;
+  const ctx = el.overlay.getContext('2d');
+  ctx.clearRect(0, 0, el.overlay.width, el.overlay.height);
+}
+
+/* ============================ Bucle principal ============================ */
+
+function loop() {
+  if (!state.running) return;
+  const v = el.video;
+
+  if (state.landmarker && v.readyState >= 2 && v.videoWidth) {
+    if (el.overlay.width !== v.videoWidth) {
+      el.overlay.width = v.videoWidth;
+      el.overlay.height = v.videoHeight;
+    }
+    if (v.currentTime !== state.lastVideoTime) {
+      state.lastVideoTime = v.currentTime;
+      const result = state.landmarker.detectForVideo(v, performance.now());
+      processResult(result, v.videoWidth, v.videoHeight);
+    }
+    tickFps();
+  }
+  requestAnimationFrame(loop);
+}
+
+function tickFps() {
+  const f = state.fps;
+  f.frames++;
+  const now = performance.now();
+  if (now - f.last >= 500) {
+    f.value = Math.round((f.frames * 1000) / (now - f.last));
+    f.frames = 0;
+    f.last = now;
+    el.hudFps.textContent = `${f.value} fps`;
+  }
+}
+
+function processResult(result, w, h) {
+  const raw = result?.landmarks?.[0];
+  const ctx = el.overlay.getContext('2d');
+  ctx.clearRect(0, 0, w, h);
+
+  if (!raw) {
+    el.hudSide.textContent = 'Sin detección';
+    return;
+  }
+
+  const lms = state.smoother.push(raw);
+  const frontalMode = el.viewMode.value === 'frontal';
+
+  if (frontalMode) {
+    const fm = frameMetricsFrontal(lms, w, h);
+    drawSkeleton(ctx, lms, w, h, null);
+    el.hudSide.textContent = 'Vista frontal';
+    renderLive([
+      { label: 'Desv. rodilla izq.', value: fm.kneeDevL, unit: ' %' },
+      { label: 'Desv. rodilla der.', value: fm.kneeDevR, unit: ' %' },
+      { label: 'Desnivel caderas', value: fm.hipTilt, unit: '°' },
+      { label: 'Desnivel hombros', value: fm.shoulderTilt, unit: '°' },
+    ]);
+    if (state.recording) {
+      state.frontalSamples.push(fm);
+      // La cadencia en frontal no es fiable; mostramos solo el conteo de frames.
+      el.hudCycles.textContent = `${state.frontalSamples.length} frames`;
+      if (performance.now() >= state.recordUntil) stopRecording(true);
+    }
+    return;
+  }
+
+  // --- Vista sagital ---
+  state.side = pickSide(lms, el.sideSelect.value);
+  const p = sidePoints(lms, state.side, w, h);
+  const m = frameMetricsSagittal(p);
+
+  drawSkeleton(ctx, lms, w, h, state.side);
+  drawAngles(ctx, p, m);
+
+  el.hudSide.textContent = `Lado: ${state.side === 'right' ? 'derecho' : 'izquierdo'}`;
+  renderLive([
+    { label: 'Rodilla', value: m.knee, unit: '°' },
+    { label: 'Cadera', value: m.hip, unit: '°' },
+    { label: 'Torso', value: m.torso, unit: '°' },
+    { label: 'Codo', value: m.elbow, unit: '°' },
+    { label: 'Hombro', value: m.shoulder, unit: '°' },
+    { label: 'Tobillo', value: m.ankle, unit: '°' },
+  ]);
+
+  if (state.recording) {
+    state.tracker.push(performance.now(), m, p);
+    const s = state.tracker.summary();
+    el.hudCycles.textContent = `${state.tracker.cycles.length} pedaladas`;
+    el.hudCadence.textContent = s && Number.isFinite(s.cadence) ? `${s.cadence.toFixed(0)} rpm` : '— rpm';
+    if (performance.now() >= state.recordUntil) stopRecording(true);
+  }
+}
+
+/* ============================== Dibujo ============================== */
+
+const COLORS = { active: '#35d07f', dim: 'rgba(160,185,210,.38)', text: '#eaf4ff' };
+
+function drawSkeleton(ctx, lms, w, h, side) {
+  const S = side === 'right' ? 'R' : side === 'left' ? 'L' : null;
+  ctx.lineWidth = Math.max(2, w / 420);
+
+  for (const [a, b] of SKELETON) {
+    const onSide = S && a.endsWith(S) && b.endsWith(S);
+    const pa = lms[LM[a]], pb = lms[LM[b]];
+    if (!pa || !pb) continue;
+    ctx.strokeStyle = !S || onSide ? COLORS.active : COLORS.dim;
+    ctx.beginPath();
+    ctx.moveTo(pa.x * w, pa.y * h);
+    ctx.lineTo(pb.x * w, pb.y * h);
+    ctx.stroke();
+  }
+
+  const r = Math.max(3, w / 300);
+  for (const name of Object.keys(LM)) {
+    const pt = lms[LM[name]];
+    if (!pt || (pt.visibility ?? 1) < 0.35) continue;
+    const onSide = S && name.endsWith(S);
+    ctx.fillStyle = !S || onSide ? COLORS.active : COLORS.dim;
+    ctx.beginPath();
+    ctx.arc(pt.x * w, pt.y * h, r, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
+function drawAngles(ctx, p, m) {
+  const fontSize = Math.max(13, el.overlay.width / 60);
+  ctx.font = `600 ${fontSize}px ${getComputedStyle(document.body).fontFamily}`;
+  ctx.textBaseline = 'middle';
+
+  const labels = [
+    [p.knee, m.knee, 'rodilla'],
+    [p.hip, m.hip, 'cadera'],
+    [p.elbow, m.elbow, 'codo'],
+    [p.shoulder, m.shoulder, 'hombro'],
+    [p.ankle, m.ankle, 'tobillo'],
+  ];
+
+  for (const [pt, val, name] of labels) {
+    if (!Number.isFinite(val)) continue;
+    const text = `${Math.round(val)}° ${name}`;
+    const tw = ctx.measureText(text).width;
+    const x = pt.x + fontSize * 0.8;
+    const y = pt.y - fontSize * 0.8;
+    ctx.fillStyle = 'rgba(5,10,16,.72)';
+    ctx.fillRect(x - 4, y - fontSize * 0.75, tw + 8, fontSize * 1.5);
+    ctx.fillStyle = COLORS.text;
+    ctx.fillText(text, x, y);
+  }
+
+  // Línea de torso respecto a la horizontal.
+  if (Number.isFinite(m.torso)) {
+    ctx.save();
+    ctx.setLineDash([6, 6]);
+    ctx.strokeStyle = 'rgba(74,168,255,.8)';
+    ctx.lineWidth = Math.max(1.5, el.overlay.width / 700);
+    ctx.beginPath();
+    ctx.moveTo(p.hip.x, p.hip.y);
+    ctx.lineTo(p.hip.x + (p.shoulder.x - p.hip.x) * 1.15, p.hip.y);
+    ctx.stroke();
+    ctx.restore();
+  }
+}
+
+/* ============================== UI: métricas ============================== */
+
+function renderLive(items) {
+  el.liveMetrics.innerHTML = items.map((i) => `
+    <div class="metric ${Number.isFinite(i.value) ? 'ok' : 'na'}">
+      <div class="m-label">${i.label}</div>
+      <div class="m-value">${Number.isFinite(i.value) ? i.value.toFixed(0) + i.unit : '—'}</div>
+    </div>`).join('');
+}
+
+function renderMetrics(container, metrics) {
+  container.innerHTML = metrics.map((m) => {
+    const [lo, hi] = m.range;
+    const span = (hi - lo) * 2.2 || 1;
+    const axisLo = lo - span / 2.2, axisHi = hi + span / 2.2;
+    const pct = (x) => `${Math.min(100, Math.max(0, ((x - axisLo) / (axisHi - axisLo)) * 100))}%`;
+    const val = Number.isFinite(m.value);
+    return `
+      <div class="metric ${m.status}" data-hint="1" title="${m.hint}">
+        <div class="m-label">${m.label}</div>
+        <div class="m-value">${val ? m.value.toFixed(m.unit === ' mm' || m.unit === ' %' ? 1 : 0) + m.unit : '—'}</div>
+        <div class="m-range">objetivo ${lo}–${hi}${m.unit}</div>
+        ${val ? `<div class="bar">
+            <div class="zone" style="left:${pct(lo)};right:calc(100% - ${pct(hi)})"></div>
+            <div class="mark" style="left:${pct(m.value)}"></div>
+          </div>` : ''}
+        <div class="m-hint">${m.hint}</div>
+      </div>`;
+  }).join('');
+
+  container.querySelectorAll('.metric[data-hint]').forEach((node) => {
+    node.addEventListener('click', () => node.classList.toggle('expanded'));
+  });
+}
+
+function renderRecs(container, recs) {
+  if (!recs.length) {
+    container.innerHTML = '<div class="placeholder">Sin recomendaciones: todo dentro de rango.</div>';
+    return;
+  }
+  container.innerHTML = recs.map((r) => `
+    <div class="rec ${r.priority}">
+      <div class="rec-top">
+        <span class="rec-area">${r.area}</span>
+        <span class="rec-prio">${r.priority === 'ok' ? 'correcto' : `prioridad ${r.priority}`}</span>
+      </div>
+      <div class="rec-action">${r.action}</div>
+      <div class="rec-why">${r.why}</div>
+      ${r.note ? `<div class="rec-note">${r.note}</div>` : ''}
+    </div>`).join('');
+}
+
+/* ============================== Medición ============================== */
+
+function startRecording() {
+  state.tracker.reset();
+  state.frontalSamples = [];
+  state.recording = true;
+  state.recordUntil = performance.now() + Number(el.duration.value || 20) * 1000;
+  el.recBadge.hidden = false;
+  el.btnRecord.textContent = 'Detener';
+  el.btnRecord.classList.remove('btn-accent');
+  el.btnRecord.classList.add('btn-danger');
+}
+
+function stopRecording(buildReport) {
+  if (!state.recording) return;
+  state.recording = false;
+  el.recBadge.hidden = true;
+  el.btnRecord.textContent = 'Iniciar medición';
+  el.btnRecord.classList.add('btn-accent');
+  el.btnRecord.classList.remove('btn-danger');
+  if (buildReport) makeReport();
+}
+
+function makeReport() {
+  const frontalMode = el.viewMode.value === 'frontal';
+  const crank = Number(el.crankLength.value || 172.5);
+
+  let summary = null;
+  let frontal = null;
+
+  if (frontalMode) {
+    if (state.frontalSamples.length < 30) return reportError('Muy pocos frames válidos. Repite la medición.');
+    const col = (k) => state.frontalSamples.map((s) => s[k]);
+    frontal = {
+      kneeDevL: median(col('kneeDevL')),
+      kneeDevR: median(col('kneeDevR')),
+      hipTilt: median(col('hipTilt')),
+      shoulderTilt: median(col('shoulderTilt')),
+      headTilt: median(col('headTilt')),
+    };
+    summary = { cycles: 0, frames: state.frontalSamples.length };
+  } else {
+    summary = state.tracker.summary();
+    if (!summary || summary.cycles < 3) {
+      return reportError('No se detectaron suficientes pedaladas completas. Revisa el encuadre lateral y pedalea de forma continua.');
+    }
+  }
+
+  const mmPerPx = frontalMode ? null : pxToMm(summary, crank);
+  const { metrics, recommendations } = evaluate(summary, {
+    profile: el.profile.value,
+    crankLengthMm: crank,
+    mmPerPx,
+    frontal,
+    frontalOnly: frontalMode,
+  });
+
+  const report = {
+    generatedAt: new Date().toISOString(),
+    rider: el.riderName.value || 'Sin nombre',
+    view: frontalMode ? 'frontal' : 'sagital',
+    side: frontalMode ? 'ambos' : state.side,
+    profile: el.profile.value,
+    crankLengthMm: crank,
+    inseamCm: Number(el.inseam.value) || null,
+    mmPerPx,
+    summary,
+    metrics,
+    recommendations,
+  };
+  state.lastReport = report;
+
+  el.reportPlaceholder.hidden = true;
+  el.report.hidden = false;
+  el.reportTitle.textContent = `Informe de bikefit · ${report.rider}`;
+  el.reportMeta.textContent = [
+    new Date(report.generatedAt).toLocaleString('es-ES'),
+    `vista ${report.view}`,
+    frontalMode ? `${summary.frames} frames` : `${summary.cycles} pedaladas`,
+    !frontalMode && Number.isFinite(summary.cadence) ? `${summary.cadence.toFixed(0)} rpm` : null,
+    `perfil ${el.profile.options[el.profile.selectedIndex].text}`,
+    mmPerPx ? `escala ${mmPerPx.toFixed(2)} mm/px` : 'sin calibración métrica',
+  ].filter(Boolean).join(' · ');
+
+  renderMetrics(el.reportMetrics, metrics);
+  renderRecs(el.reportRecs, recommendations);
+  selectTab('report');
+}
+
+function reportError(msg) {
+  el.report.hidden = true;
+  el.reportPlaceholder.hidden = false;
+  el.reportPlaceholder.textContent = msg;
+  selectTab('report');
+}
+
+/* ============================== Estimaciones ============================== */
+
+function updateEstimates() {
+  const inseam = Number(el.inseam.value);
+  if (!inseam || inseam < 50) {
+    el.estimates.hidden = true;
+    return;
+  }
+  const cm = inseam;
+  const lemond = cm * 0.883;             // pedalier -> parte alta del sillín
+  const hamley = cm * 1.09;              // sillín -> pedal en PMI (con biela)
+  const crank = Math.round((cm * 2.16) / 2.5) * 2.5; // ~21.6% de la entrepierna
+  const reach = cm * 0.52;               // orientativo sillín -> manillar
+  el.estimates.hidden = false;
+  el.estimates.innerHTML = `
+    <b>Punto de partida según entrepierna (${cm} cm)</b><br>
+    Altura de sillín (LeMond, 0.883): <b>${lemond.toFixed(1)} cm</b><br>
+    Altura sillín→pedal en PMI (Hamley, 1.09): <b>${hamley.toFixed(1)} cm</b><br>
+    Biela sugerida: <b>${crank.toFixed(1)} mm</b><br>
+    Alcance sillín→manillar orientativo: <b>${reach.toFixed(1)} cm</b><br>
+    <span style="color:#7fc3a3">Son fórmulas de partida; manda siempre lo que midan los ángulos.</span>`;
+}
+
+/* ============================== Eventos ============================== */
+
+function selectTab(name) {
+  document.querySelectorAll('.tab').forEach((t) => t.classList.toggle('active', t.dataset.tab === name));
+  document.querySelectorAll('.tabpane').forEach((p) => p.classList.toggle('active', p.id === `tab-${name}`));
+}
+
+document.querySelectorAll('.tab').forEach((t) => {
+  t.addEventListener('click', () => selectTab(t.dataset.tab));
+});
+
+el.btnCamera.addEventListener('click', () => {
+  if (state.stream) stopCamera();
+  else startCamera(el.cameraSelect.value || null);
+});
+
+el.btnRecord.addEventListener('click', () => {
+  if (state.recording) stopRecording(true);
+  else { startRecording(); selectTab('live'); }
+});
+
+el.btnSnapshot.addEventListener('click', () => {
+  const c = document.createElement('canvas');
+  c.width = el.video.videoWidth;
+  c.height = el.video.videoHeight;
+  const ctx = c.getContext('2d');
+  if (el.mirror.checked) { ctx.translate(c.width, 0); ctx.scale(-1, 1); }
+  ctx.drawImage(el.video, 0, 0);
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  if (el.mirror.checked) { ctx.translate(c.width, 0); ctx.scale(-1, 1); }
+  ctx.drawImage(el.overlay, 0, 0);
+  const a = document.createElement('a');
+  a.download = `bikefit-${Date.now()}.png`;
+  a.href = c.toDataURL('image/png');
+  a.click();
+});
+
+el.cameraSelect.addEventListener('change', () => startCamera(el.cameraSelect.value));
+el.modelQuality.addEventListener('change', () => initEngine(el.modelQuality.value));
+el.mirror.addEventListener('change', () => el.stage.classList.toggle('mirrored', el.mirror.checked));
+el.inseam.addEventListener('input', updateEstimates);
+el.viewMode.addEventListener('change', () => {
+  state.tracker.reset();
+  state.frontalSamples = [];
+  el.hudCadence.textContent = '— rpm';
+  el.hudCycles.textContent = '0 pedaladas';
+});
+
+el.btnExport.addEventListener('click', () => {
+  if (!state.lastReport) return;
+  const blob = new Blob([JSON.stringify(state.lastReport, null, 2)], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `bikefit-${(state.lastReport.rider || 'ciclista').replace(/\s+/g, '-').toLowerCase()}.json`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+});
+
+el.btnPrint.addEventListener('click', () => window.print());
+
+window.addEventListener('beforeunload', stopCamera);
+
+/* ============================== Modo demo ============================== */
+
+// `?demo=1` monta un informe con datos de ejemplo. Sirve para revisar el
+// formato de salida sin montar la bici en el rodillo.
+function runDemo() {
+  state.tracker.cycles = Array.from({ length: 14 }, (_, i) => ({
+    durationMs: 682 + ((i % 3) - 1) * 12,
+    kneeExtension: 134 + ((i % 4) - 1.5) * 1.4,
+    kneeFlexion: 71 + ((i % 3) - 1),
+    hipMin: 44, hipMax: 92,
+    ankleAtBdc: 112, ankleAtTdc: 86, ankleRom: 22,
+    torso: 47, elbow: 172, shoulder: 88, arm: 24,
+    kopsPx: 18.7, femurPx: 266, crankTravelPx: 230,
+  }));
+  el.riderName.value = el.riderName.value || 'Ciclista de ejemplo';
+  makeReport();
+}
+
+/** Avisa de los dos bloqueos que impiden la cámara antes incluso de pedirla. */
+async function warnAboutBlockers() {
+  if (!window.isSecureContext) {
+    showStageError(
+      'Contexto no seguro: la cámara no se puede abrir',
+      'Los navegadores solo dan acceso a la cámara en <code>localhost</code> o <code>https</code>. Arranca el servidor con <code>node server.mjs</code> y entra por <code>http://localhost:5173</code>.',
+      await collectDiagnostics(), null);
+    return;
+  }
+  if (window.self !== window.top) {
+    showStageError(
+      'Página incrustada en un iframe',
+      'Si el contenedor no concede permiso de cámara, <strong>Activar cámara</strong> fallará. Ábrela en una pestaña normal: <code>http://localhost:5173</code>. Puedes intentarlo igualmente.',
+      await collectDiagnostics(), null);
+  }
+}
+
+el.btnCamera.disabled = true;
+el.modelQuality.value = defaultModelKey();
+initEngine(el.modelQuality.value);
+warnAboutBlockers();
+if (new URLSearchParams(location.search).has('demo')) runDemo();

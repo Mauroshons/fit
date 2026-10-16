@@ -1,0 +1,10 @@
+{
+  "name": "bikefit-lab",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Estudio biomecanico de bikefit para bicicleta de ruta con vision por computador en el navegador",
+  "scripts": {
+    "start": "node server.mjs"
+  }
+}

@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="theme-color" content="#0d1117" />
+<meta name="apple-mobile-web-app-title" content="BikeFit" />
+<title>BikeFit Lab · Estudio biomecánico para bici de ruta</title>
+<link rel="stylesheet" href="css/styles.css" />
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🚴</text></svg>" />
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">🚴</span>
+    <div>
+      <h1>BikeFit Lab</h1>
+      <p>Estudio biomecánico asistido por visión · bicicleta de ruta</p>
+    </div>
+  </div>
+  <div class="topbar-actions">
+    <span id="engineState" class="pill pill-wait">Cargando modelo…</span>
+  </div>
+</header>
+
+<main>
+  <!-- ======================= PANEL IZQUIERDO: CAPTURA ======================= -->
+  <section class="panel capture">
+    <div class="stage" id="stage">
+      <video id="video" playsinline muted autoplay></video>
+      <canvas id="overlay"></canvas>
+
+      <div class="stage-hud">
+        <div class="hud-chip" id="hudSide">Lado: —</div>
+        <div class="hud-chip" id="hudFps">0 fps</div>
+        <div class="hud-chip" id="hudCycles">0 pedaladas</div>
+        <div class="hud-chip" id="hudCadence">— rpm</div>
+      </div>
+
+      <div class="stage-overlay-msg" id="stageMsg">
+        <div>
+          <h2>Cámara apagada</h2>
+          <p>Pulsa <strong>Activar cámara</strong> para empezar. Necesitas conexión segura (localhost o https).</p>
+        </div>
+      </div>
+
+      <div class="rec-badge" id="recBadge" hidden><span class="dot"></span> MIDIENDO</div>
+    </div>
+
+    <div class="controls">
+      <button id="btnCamera" class="btn btn-primary">Activar cámara</button>
+      <button id="btnRecord" class="btn btn-accent" disabled>Iniciar medición</button>
+      <button id="btnSnapshot" class="btn" disabled>Capturar foto</button>
+      <select id="cameraSelect" class="btn btn-select" title="Cámara" hidden></select>
+    </div>
+
+    <div class="guide" id="guide">
+      <h3>Protocolo de captura</h3>
+      <ol>
+        <li>Bici en <strong>rodillo</strong>, nivelada. Cámara sobre trípode a la altura del pedalier.</li>
+        <li>Plano <strong>perpendicular</strong> al eje de la bici, a 2–3 m, con el ciclista completo en cuadro.</li>
+        <li>Ropa ajustada y marcadores visibles ayudan a la detección. Buena luz, sin contraluz.</li>
+        <li>Calienta 5 min, mantén <strong>85–95 rpm</strong> y mira al frente.</li>
+        <li>Pulsa <em>Iniciar medición</em> y pedalea natural durante al menos 12 pedaladas.</li>
+      </ol>
+    </div>
+  </section>
+
+  <!-- ======================= PANEL DERECHO: DATOS ======================= -->
+  <section class="panel data">
+    <div class="tabs" role="tablist">
+      <button class="tab active" data-tab="setup" role="tab">Configuración</button>
+      <button class="tab" data-tab="live" role="tab">En vivo</button>
+      <button class="tab" data-tab="report" role="tab">Informe</button>
+    </div>
+
+    <!-- --- Configuración --- -->
+    <div class="tabpane active" id="tab-setup">
+      <div class="field">
+        <label for="riderName">Ciclista</label>
+        <input id="riderName" type="text" placeholder="Nombre o identificador" />
+      </div>
+
+      <div class="field">
+        <label for="viewMode">Vista de análisis</label>
+        <select id="viewMode">
+          <option value="sagittal">Lateral (sagital) — ángulos articulares</option>
+          <option value="frontal">Frontal — simetría y tracking de rodilla</option>
+        </select>
+        <small>La lateral es la medición principal; la frontal complementa con calas y simetría.</small>
+      </div>
+
+      <div class="field">
+        <label for="profile">Perfil de uso</label>
+        <select id="profile">
+          <option value="granfondo">Gran fondo / confort</option>
+          <option value="endurance" selected>Endurance / rodador</option>
+          <option value="race">Competición / agresivo</option>
+        </select>
+        <small>Ajusta los rangos objetivo de torso, cadera, codo y hombro.</small>
+      </div>
+
+      <div class="field-row">
+        <div class="field">
+          <label for="sideSelect">Lado visible</label>
+          <select id="sideSelect">
+            <option value="auto" selected>Automático</option>
+            <option value="right">Derecho</option>
+            <option value="left">Izquierdo</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="crankLength">Longitud de biela (mm)</label>
+          <input id="crankLength" type="number" value="172.5" step="2.5" min="140" max="200" />
+        </div>
+      </div>
+
+      <div class="field-row">
+        <div class="field">
+          <label for="inseam">Entrepierna (cm)</label>
+          <input id="inseam" type="number" placeholder="p. ej. 84" step="0.5" min="50" max="110" />
+        </div>
+        <div class="field">
+          <label for="duration">Duración de la medición (s)</label>
+          <input id="duration" type="number" value="20" step="5" min="10" max="90" />
+        </div>
+      </div>
+
+      <div class="field">
+        <label for="modelQuality">Precisión del modelo</label>
+        <select id="modelQuality">
+          <option value="lite">Ligero (~5 MB) — móviles y equipos modestos</option>
+          <option value="full" selected>Estándar (~9 MB) — recomendado</option>
+          <option value="heavy">Alto (~29 MB) — solo equipos potentes</option>
+        </select>
+        <small>Más precisión = centros articulares más estables, pero menos fps. Cambiarlo recarga el modelo.</small>
+      </div>
+
+      <div class="field">
+        <label><input type="checkbox" id="mirror" /> Espejar imagen (cámara frontal)</label>
+      </div>
+
+      <div id="estimates" class="estimate-box" hidden></div>
+
+      <div class="note">
+        <strong>Aviso:</strong> esto es una herramienta de apoyo, no un diagnóstico médico.
+        Si tienes dolor persistente, consulta con un fitter o profesional sanitario.
+      </div>
+    </div>
+
+    <!-- --- En vivo --- -->
+    <div class="tabpane" id="tab-live">
+      <div id="liveMetrics" class="metric-grid"></div>
+      <div id="livePlaceholder" class="placeholder">Activa la cámara para ver los ángulos en tiempo real.</div>
+    </div>
+
+    <!-- --- Informe --- -->
+    <div class="tabpane" id="tab-report">
+      <div id="reportPlaceholder" class="placeholder">Todavía no hay mediciones. Ejecuta una sesión desde el panel izquierdo.</div>
+      <div id="report" hidden>
+        <div class="report-head">
+          <div>
+            <h2 id="reportTitle">Informe de bikefit</h2>
+            <p id="reportMeta" class="muted"></p>
+          </div>
+          <div class="report-actions">
+            <button id="btnExport" class="btn btn-small">Exportar JSON</button>
+            <button id="btnPrint" class="btn btn-small">Imprimir / PDF</button>
+          </div>
+        </div>
+        <h3>Métricas medidas</h3>
+        <div id="reportMetrics" class="metric-grid"></div>
+        <h3>Recomendaciones de ajuste</h3>
+        <div id="reportRecs"></div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<script type="module" src="js/app.js"></script>
+</body>
+</html>
