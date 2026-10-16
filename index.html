@@ -72,6 +72,7 @@
     <div class="tabs" role="tablist">
       <button class="tab active" data-tab="setup" role="tab">Configuración</button>
       <button class="tab" data-tab="live" role="tab">En vivo</button>
+      <button class="tab" data-tab="cotas" role="tab">Cotas</button>
       <button class="tab" data-tab="report" role="tab">Informe</button>
     </div>
 
@@ -160,6 +161,53 @@
         Si no, aparece «—» en vez de un número inventado. En el overlay, los puntos
         poco fiables se dibujan <span class="vis-swatch"></span> huecos y en ámbar.
       </p>
+    </div>
+
+    <!-- --- Cotas de la bici --- -->
+    <div class="tabpane" id="tab-cotas">
+      <p class="vis-help" style="margin-top:0">
+        Mide el <strong>hardware</strong>, no el cuerpo: altura y retroceso del sillín respecto
+        al pedalier, inclinación, caída y alcance al manillar. Son las cotas que replicas con
+        cinta métrica al montar otro sillín, otra tija u otra potencia.
+      </p>
+
+      <div class="controls" style="margin-top:12px">
+        <button id="btnFreeze" class="btn btn-primary" disabled>Congelar imagen</button>
+        <button id="btnUndoPoint" class="btn btn-small" disabled>Deshacer punto</button>
+        <button id="btnClearPoints" class="btn btn-small" disabled>Limpiar</button>
+      </div>
+
+      <div id="measurePrompt" class="measure-prompt" hidden></div>
+
+      <div id="measureResults" hidden>
+        <h3>Cotas medidas</h3>
+        <div id="measureValues" class="metric-grid"></div>
+        <p id="measurePrecision" class="vis-help" hidden></p>
+
+        <h3>Guardar como ficha</h3>
+        <div class="field-row" style="align-items:end">
+          <div class="field" style="margin-bottom:0">
+            <label for="fichaName">Nombre</label>
+            <input id="fichaName" type="text" placeholder="p. ej. Selle Italia SLR" />
+          </div>
+          <div class="field" style="margin-bottom:0">
+            <button id="btnSaveFicha" class="btn btn-accent" style="width:100%">Guardar ficha</button>
+          </div>
+        </div>
+      </div>
+
+      <div id="fichasBox" hidden>
+        <h3>Fichas guardadas</h3>
+        <ul id="fichasList" class="fichas"></ul>
+        <div id="fichaDiff"></div>
+      </div>
+
+      <div class="note" style="margin-top:18px">
+        <strong>Precisión:</strong> es medición 2D sobre una foto. La cámara debe estar
+        perpendicular al plano de la bici y centrada a la altura del pedalier; si está girada
+        o alta, las cotas se deforman. Para comparar dos sillines, <em>no muevas la cámara
+        entre las dos fotos</em> y marca los puntos en sitios equivalentes.
+      </div>
     </div>
 
     <!-- --- Informe --- -->

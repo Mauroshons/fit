@@ -10,6 +10,7 @@ import {
   PedalCycleTracker, pxToMm,
 } from './analyzer.js';
 import { evaluate } from './fitrules.js';
+import { POINTS, computeMeasures, diffMeasures } from './measure.js';
 
 const WASM_BASE = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm';
 
@@ -38,6 +39,11 @@ const el = {
   reportMetrics: $('reportMetrics'), reportRecs: $('reportRecs'),
   reportTitle: $('reportTitle'), reportMeta: $('reportMeta'),
   btnExport: $('btnExport'), btnPrint: $('btnPrint'),
+  btnFreeze: $('btnFreeze'), btnUndoPoint: $('btnUndoPoint'), btnClearPoints: $('btnClearPoints'),
+  measurePrompt: $('measurePrompt'), measureResults: $('measureResults'),
+  measureValues: $('measureValues'), measurePrecision: $('measurePrecision'),
+  fichaName: $('fichaName'), btnSaveFicha: $('btnSaveFicha'),
+  fichasBox: $('fichasBox'), fichasList: $('fichasList'), fichaDiff: $('fichaDiff'),
 };
 
 const state = {
@@ -55,6 +61,12 @@ const state = {
   lastReport: null,
   modelKey: 'full',
   delegate: null,
+  // Medición de cotas sobre fotograma congelado.
+  frozen: false,
+  points: {},
+  measures: null,
+  fichas: [],
+  baseline: null,
 };
 
 /* ============================ Motor de pose ============================ */
@@ -257,6 +269,7 @@ async function startCamera(deviceId) {
     el.btnCamera.textContent = 'Apagar cámara';
     el.btnRecord.disabled = false;
     el.btnSnapshot.disabled = false;
+    el.btnFreeze.disabled = false;
     el.livePlaceholder.hidden = true;
     state.running = true;
     state.smoother.reset();
@@ -287,6 +300,15 @@ function stopCamera() {
   el.btnCamera.textContent = 'Activar cámara';
   el.btnRecord.disabled = true;
   el.btnSnapshot.disabled = true;
+  el.btnFreeze.disabled = true;
+  // Los marcadores se refieren a un fotograma que ya no existe.
+  state.frozen = false;
+  state.points = {};
+  state.measures = null;
+  el.stage.classList.remove('measuring');
+  el.btnFreeze.textContent = 'Congelar imagen';
+  el.measurePrompt.hidden = true;
+  el.measureResults.hidden = true;
   el.stageMsg.innerHTML = STAGE_MSG_DEFAULT;
   el.stageMsg.hidden = false;
   const ctx = el.overlay.getContext('2d');
@@ -298,6 +320,13 @@ function stopCamera() {
 function loop() {
   if (!state.running) return;
   const v = el.video;
+
+  // Con la imagen congelada el overlay pertenece a los marcadores de cotas:
+  // seguir detectando lo borraría en cada frame.
+  if (state.frozen) {
+    requestAnimationFrame(loop);
+    return;
+  }
 
   if (state.landmarker && v.readyState >= 2 && v.videoWidth) {
     if (el.overlay.width !== v.videoWidth) {
@@ -623,6 +652,12 @@ function makeReport() {
     summary,
     metrics,
     recommendations,
+    // Cotas de la bici medidas en la pestaña Cotas, si las hay. Sin esto el
+    // informe documenta la postura pero no la máquina que la produce.
+    cotas: state.measures
+      ? { scale: state.measures.scale, values: state.measures.values }
+      : null,
+    fichas: state.fichas,
   };
   state.lastReport = report;
 
@@ -712,6 +747,48 @@ el.btnSnapshot.addEventListener('click', () => {
 
 el.cameraSelect.addEventListener('change', () => startCamera(el.cameraSelect.value));
 el.modelQuality.addEventListener('change', () => initEngine(el.modelQuality.value));
+
+/* --- Cotas --- */
+el.btnFreeze.addEventListener('click', () => setFrozen(!state.frozen));
+el.btnUndoPoint.addEventListener('click', () => {
+  const placed = POINTS.filter((p) => state.points[p.key]);
+  if (placed.length) delete state.points[placed[placed.length - 1].key];
+  renderMeasure();
+});
+el.btnClearPoints.addEventListener('click', () => { state.points = {}; renderMeasure(); });
+
+// Ajuste fino del último punto marcado: un píxel de imagen por pulsación.
+addEventListener('keydown', (ev) => {
+  if (!state.frozen) return;
+  const d = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] }[ev.key];
+  if (!d) return;
+  const placed = POINTS.filter((p) => state.points[p.key]);
+  if (!placed.length) return;
+  ev.preventDefault();
+  const p = state.points[placed[placed.length - 1].key];
+  const step = ev.shiftKey ? 5 : 1;
+  p.x = Math.min(el.overlay.width, Math.max(0, p.x + d[0] * step));
+  p.y = Math.min(el.overlay.height, Math.max(0, p.y + d[1] * step));
+  renderMeasure();
+});
+el.stage.addEventListener('click', onStageClick);
+el.crankLength.addEventListener('input', () => { if (state.frozen) renderMeasure(); });
+
+el.btnSaveFicha.addEventListener('click', () => {
+  if (!state.measures) return;
+  const name = el.fichaName.value.trim() || `Ficha ${state.fichas.length + 1}`;
+  // Copia profunda: guardar la referencia dejaría la ficha expuesta a los
+  // recálculos posteriores de state.measures.
+  state.fichas.push({
+    name, at: Date.now(), scale: state.measures.scale,
+    values: state.measures.values.map((v) => ({ ...v })),
+  });
+  saveFichas(state.fichas);
+  el.fichaName.value = '';
+  // La recién guardada pasa a ser la referencia solo si no había ninguna.
+  if (state.baseline === null) state.baseline = state.fichas.length - 1;
+  renderFichas();
+});
 el.mirror.addEventListener('change', () => el.stage.classList.toggle('mirrored', el.mirror.checked));
 el.inseam.addEventListener('input', updateEstimates);
 el.viewMode.addEventListener('change', () => {
@@ -734,6 +811,221 @@ el.btnExport.addEventListener('click', () => {
 el.btnPrint.addEventListener('click', () => window.print());
 
 window.addEventListener('beforeunload', stopCamera);
+
+/* ============================== Cotas de la bici ============================== */
+
+/**
+ * Traduce un clic del ratón/dedo a píxeles de la imagen.
+ * El canvas se pinta con `object-fit: contain`, así que hay bandas vacías a los
+ * lados o arriba; sin descontarlas, los puntos caerían desplazados.
+ */
+function eventToImagePoint(ev) {
+  const box = el.overlay.getBoundingClientRect();
+  const iw = el.overlay.width, ih = el.overlay.height;
+  if (!iw || !ih) return null;
+
+  const fit = Math.min(box.width / iw, box.height / ih);
+  const shownW = iw * fit, shownH = ih * fit;
+  const padX = (box.width - shownW) / 2, padY = (box.height - shownH) / 2;
+
+  const touch = ev.touches?.[0] ?? ev.changedTouches?.[0] ?? ev;
+  let x = (touch.clientX - box.left - padX) / fit;
+  const y = (touch.clientY - box.top - padY) / fit;
+  if (x < 0 || y < 0 || x > iw || y > ih) return null;   // clic en la banda vacía
+  if (el.mirror.checked) x = iw - x;                      // el CSS invierte la X
+  return { x, y };
+}
+
+function nextPointSpec() {
+  return POINTS.find((p) => !state.points[p.key]) ?? null;
+}
+
+function onStageClick(ev) {
+  if (!state.frozen) return;
+  const spec = nextPointSpec();
+  if (!spec) return;
+  const pt = eventToImagePoint(ev);
+  if (!pt) return;
+  state.points[spec.key] = pt;
+  renderMeasure();
+}
+
+function renderMeasure() {
+  const placed = Object.keys(state.points).length;
+  el.btnUndoPoint.disabled = placed === 0;
+  el.btnClearPoints.disabled = placed === 0;
+
+  const spec = nextPointSpec();
+  el.measurePrompt.hidden = !state.frozen;
+  if (state.frozen) {
+    el.measurePrompt.innerHTML = spec
+      ? `<b>${placed + 1}/${POINTS.length} · Marca: ${spec.label}</b><span>${spec.hint}</span>`
+      : '<b>Listo: los cinco puntos están marcados</b><span>Revisa las cotas y guárdalas como ficha. Puedes deshacer el último punto si quedó torcido.</span>';
+  }
+
+  const m = computeMeasures(state.points, Number(el.crankLength.value || 172.5));
+  state.measures = m;
+  el.measureResults.hidden = !m;
+  if (m) {
+    // Cuánto vale en milímetros un píxel de pantalla. El escenario reduce la
+    // imagen, así que la precisión del dedo es peor que la de la imagen.
+    const box = el.overlay.getBoundingClientRect();
+    const fit = Math.min(box.width / el.overlay.width, box.height / el.overlay.height) || 1;
+    const mmPerScreenPx = m.scale / fit;
+    el.measurePrecision.hidden = false;
+    el.measurePrecision.innerHTML =
+      `Escala <b>${m.scale.toFixed(2)} mm</b> por píxel de imagen. A este tamaño de pantalla,
+       cada píxel que pinchas vale <b>${mmPerScreenPx.toFixed(1)} mm</b>: usa las flechas del
+       teclado para afinar el último punto, o amplía la ventana antes de marcar.`;
+    el.measureValues.innerHTML = m.values.map((v) => `
+      <div class="metric ok" title="${v.hint}">
+        <div class="m-label">${v.label}</div>
+        <div class="m-value">${v.value.toFixed(v.unit === '°' ? 1 : 0)}${v.unit}</div>
+        <div class="m-hint">${v.hint}</div>
+      </div>`).join('');
+    el.measureValues.querySelectorAll('.metric').forEach((n) =>
+      n.addEventListener('click', () => n.classList.toggle('expanded')));
+  }
+  drawMeasureOverlay();
+  // La comparación depende de la medición actual: sin esto la tabla se queda
+  // con la que se generó al guardar la ficha, que da diferencia cero.
+  renderDiff();
+}
+
+function drawMeasureOverlay() {
+  const ctx = el.overlay.getContext('2d');
+  const w = el.overlay.width, h = el.overlay.height;
+  ctx.clearRect(0, 0, w, h);
+  if (!state.frozen) return;
+
+  const r = Math.max(5, w / 150);
+  const font = Math.max(12, w / 70);
+  ctx.font = `600 ${font}px ${getComputedStyle(document.body).fontFamily}`;
+  ctx.textBaseline = 'middle';
+
+  // Ejes desde el pedalier: dan contexto visual a las cotas.
+  if (state.points.bb) {
+    const { x, y } = state.points.bb;
+    ctx.save();
+    ctx.setLineDash([5, 6]);
+    ctx.strokeStyle = 'rgba(74,168,255,.55)';
+    ctx.lineWidth = Math.max(1, w / 900);
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y);
+    ctx.moveTo(x, 0); ctx.lineTo(x, h);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  // Plano de apoyo del sillín.
+  if (state.points.nose && state.points.rear) {
+    ctx.strokeStyle = '#35d07f';
+    ctx.lineWidth = Math.max(2, w / 400);
+    ctx.beginPath();
+    ctx.moveTo(state.points.nose.x, state.points.nose.y);
+    ctx.lineTo(state.points.rear.x, state.points.rear.y);
+    ctx.stroke();
+  }
+
+  for (const spec of POINTS) {
+    const p = state.points[spec.key];
+    if (!p) continue;
+    ctx.fillStyle = '#ff5a4e';
+    ctx.strokeStyle = '#fff';
+    ctx.lineWidth = Math.max(1.5, w / 700);
+    ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+    // Cruz interior para afinar la lectura del centro.
+    ctx.beginPath();
+    ctx.moveTo(p.x - r * 1.9, p.y); ctx.lineTo(p.x + r * 1.9, p.y);
+    ctx.moveTo(p.x, p.y - r * 1.9); ctx.lineTo(p.x, p.y + r * 1.9);
+    ctx.stroke();
+
+    const text = spec.label;
+    const tw = ctx.measureText(text).width;
+    ctx.fillStyle = 'rgba(5,10,16,.78)';
+    ctx.fillRect(p.x + r * 2, p.y - font, tw + 8, font * 1.5);
+    ctx.fillStyle = '#eaf4ff';
+    ctx.fillText(text, p.x + r * 2 + 4, p.y - font * 0.25);
+  }
+}
+
+function setFrozen(on) {
+  state.frozen = on;
+  el.stage.classList.toggle('measuring', on);
+  el.btnFreeze.textContent = on ? 'Reanudar vídeo' : 'Congelar imagen';
+  el.btnFreeze.classList.toggle('btn-primary', !on);
+  if (on) {
+    el.video.pause();
+  } else {
+    el.video.play().catch(() => {});
+    el.measurePrompt.hidden = true;
+  }
+  renderMeasure();
+}
+
+/* --- Fichas: persistencia y comparación --- */
+
+const FICHAS_KEY = 'bikefit.fichas.v1';
+
+function loadFichas() {
+  try {
+    return JSON.parse(localStorage.getItem(FICHAS_KEY) ?? '[]');
+  } catch {
+    return [];   // modo privado o almacenamiento bloqueado
+  }
+}
+
+function saveFichas(list) {
+  try {
+    localStorage.setItem(FICHAS_KEY, JSON.stringify(list.slice(-10)));
+  } catch { /* sin persistencia: las fichas viven solo en esta sesión */ }
+}
+
+function renderFichas() {
+  const list = state.fichas;
+  el.fichasBox.hidden = list.length === 0;
+  el.fichasList.innerHTML = list.map((f, i) => `
+    <li>
+      <label>
+        <input type="radio" name="baseline" value="${i}" ${state.baseline === i ? 'checked' : ''} />
+        <b>${f.name}</b>
+        <span>${new Date(f.at).toLocaleString('es-ES')}</span>
+      </label>
+      <button class="btn btn-small" data-del="${i}">Borrar</button>
+    </li>`).join('');
+
+  el.fichasList.querySelectorAll('input[name=baseline]').forEach((r) =>
+    r.addEventListener('change', () => { state.baseline = Number(r.value); renderDiff(); }));
+  el.fichasList.querySelectorAll('button[data-del]').forEach((b) =>
+    b.addEventListener('click', () => {
+      const i = Number(b.dataset.del);
+      state.fichas.splice(i, 1);
+      if (state.baseline === i) state.baseline = null;
+      else if (state.baseline > i) state.baseline--;
+      saveFichas(state.fichas);
+      renderFichas();
+    }));
+  renderDiff();
+}
+
+function renderDiff() {
+  const base = state.fichas[state.baseline];
+  if (!base || !state.measures) { el.fichaDiff.innerHTML = ''; return; }
+  const rows = diffMeasures(base, state.measures);
+  el.fichaDiff.innerHTML = `
+    <h3>Cambio respecto a «${base.name}»</h3>
+    <table class="diff">
+      <tbody>${rows.map((d) => `
+        <tr class="${d.significant ? 'sig' : ''}">
+          <td>${d.label}</td>
+          <td class="num">${d.before.toFixed(d.unit === '°' ? 1 : 0)}</td>
+          <td class="arrow">→</td>
+          <td class="num">${d.after.toFixed(d.unit === '°' ? 1 : 0)}</td>
+          <td class="num delta">${d.delta >= 0 ? '+' : ''}${d.delta.toFixed(d.unit === '°' ? 1 : 0)}${d.unit}</td>
+        </tr>`).join('')}</tbody>
+    </table>
+    <p class="vis-help">Resaltado lo que cambió más de 2 mm o medio grado; por debajo de eso
+    es ruido de marcado, no un cambio real de posición.</p>`;
+}
 
 /* ============================== Modo demo ============================== */
 
@@ -775,4 +1067,9 @@ el.btnCamera.disabled = true;
 el.modelQuality.value = defaultModelKey();
 initEngine(el.modelQuality.value);
 warnAboutBlockers();
+state.fichas = loadFichas();
+// Al volver tras cambiar una pieza, lo que quieres comparar es contra lo
+// último que mediste: queda preseleccionado.
+if (state.fichas.length) state.baseline = state.fichas.length - 1;
+renderFichas();
 if (new URLSearchParams(location.search).has('demo')) runDemo();

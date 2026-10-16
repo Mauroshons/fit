@@ -297,6 +297,44 @@ ul.vis-list li.weak i b { background: var(--warn); }
 .bar .zone { position: absolute; top: 0; bottom: 0; background: rgba(53, 208, 127, .35); }
 .bar .mark { position: absolute; top: -2px; width: 2px; height: 8px; background: var(--text); border-radius: 1px; }
 
+/* ----------------------------- Cotas ----------------------------- */
+.stage.measuring { cursor: crosshair; }
+.stage.measuring::after {
+  content: 'IMAGEN CONGELADA';
+  position: absolute; left: 50%; bottom: 10px; transform: translateX(-50%);
+  font-size: 11px; letter-spacing: .8px; font-weight: 600;
+  padding: 4px 11px; border-radius: 7px;
+  background: rgba(74, 168, 255, .17);
+  border: 1px solid rgba(74, 168, 255, .5);
+  color: #9fd0ff; pointer-events: none;
+}
+
+.measure-prompt {
+  margin: 12px 0; padding: 11px 13px;
+  border-radius: 9px; background: #10243a; border: 1px solid #1d3f63;
+}
+.measure-prompt b { display: block; font-size: 13.5px; color: #cfe6ff; margin-bottom: 3px; }
+.measure-prompt span { font-size: 12.5px; color: #8fb4d6; line-height: 1.5; }
+
+ul.fichas { list-style: none; margin: 0 0 14px; padding: 0; }
+ul.fichas li {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  padding: 8px 11px; margin-bottom: 7px;
+  border: 1px solid var(--line); border-radius: 9px; background: #121821;
+}
+ul.fichas label { display: flex; align-items: baseline; gap: 8px; cursor: pointer; flex: 1; min-width: 0; }
+ul.fichas input { accent-color: var(--accent); flex: none; }
+ul.fichas b { font-size: 13.5px; }
+ul.fichas span { font-size: 11.5px; color: var(--muted); }
+
+table.diff { width: 100%; border-collapse: collapse; font-size: 13px; }
+table.diff td { padding: 6px 4px; border-bottom: 1px solid var(--line); color: #b9c6d4; }
+table.diff td.num { text-align: right; font-variant-numeric: tabular-nums; }
+table.diff td.arrow { text-align: center; color: var(--muted); width: 1.6em; }
+table.diff td.delta { color: var(--muted); }
+table.diff tr.sig td { color: var(--text); }
+table.diff tr.sig td.delta { color: var(--warn); font-weight: 600; }
+
 /* ----------------------------- Informe ----------------------------- */
 .report-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; }
 .report-head h2 { margin: 0; font-size: 17px; }

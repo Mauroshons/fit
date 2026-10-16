@@ -97,6 +97,26 @@ el selector).
 **Vista frontal** — complemento: desviación lateral de cada rodilla (valgo/varo),
 desnivel de caderas y de hombros.
 
+**Cotas de la bici** (pestaña *Cotas*) — mide el hardware, no el cuerpo. Sobre un
+fotograma congelado se marcan cinco puntos (pedalier, eje del pedal, punta y
+trasera del sillín, centro del manillar) y se obtienen:
+
+| Cota | Para qué |
+|---|---|
+| Altura de sillín | La que replicas con cinta métrica al montar otro sillín |
+| Altura de punta y de trasera | Juntas definen el plano de apoyo sin ambigüedad |
+| Retroceso de punta y de trasera | Posición horizontal respecto al pedalier |
+| Inclinación del sillín | Grados respecto a la horizontal; + = punta arriba |
+| Caída y alcance al manillar | Relación sillín–cockpit |
+
+La escala se calibra marcando el eje del pedal: su distancia al pedalier es la
+longitud de biela, esté la biela en la posición que esté.
+
+Las mediciones se guardan como **fichas** con nombre, persisten entre sesiones y
+se comparan contra una de referencia, resaltando lo que cambió más de 2 mm o
+medio grado. Ese es el flujo para cambiar de sillín: mides el actual, lo guardas,
+montas el nuevo, vuelves a medir y ves exactamente cuánto se movió la posición.
+
 ## Cómo funciona
 
 - `js/analyzer.js` — extrae métricas por frame y segmenta los ciclos de pedaleo
